@@ -65,22 +65,24 @@
 #include <opencv2/core/types.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/core/eigen.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/opencv.hpp>
 #include <cv.hpp>
 #include <cv_bridge/cv_bridge.h>
-
+#include<ceres/ceres.h>
+#include<ceres/rotation.h>
 #include <opencv2/core.hpp>
 #define DISTORTION 0
 using namespace std;
+
 class cloudwithdes
 {
 private:
     /* data */
 public:
-    cloudwithdes(/* args */);
-    ~cloudwithdes();
    std::vector<pcl::PointXYZI> cloud;
     cv::Mat descriptor;
-}
+};
 
 struct ICPCeres
 {
@@ -88,18 +90,22 @@ struct ICPCeres
 
     template<typename T>
     //camera表示?待优化的位姿参数，即参数块？
-    bool operator()(const T *const camera,T* residual)const
+    bool operator()(const T *const camera,T* residual)const//操作符重载是在库内的重载
     {
         T p[3];
         T point[3];
+        //在优化中T一般优化的参数块，是double类型数组，类似eigen3f point3f的三维是不能传入的。
+        //
         point[0] = T(_xyz.x);
         point[1] = T(_xyz.y);  
         point[2] = T(_xyz.z);
-        AngleAxisRotatePoint(camera,point,p);//先算旋转后的坐标
+        ceres:: AngleAxisRotatePoint(camera,point,p);//先算旋转后的坐标
+       
         p[0]+=camera[3];
         p[1]+=camera[4];
         p[2]+=camera[5];//加上平移后的坐标
-
+        
+        
         residual[0]= T(_uvw.x) - p[0];
         residual[1]= T(_uvw.y) - p[1];
         residual[2]= T(_uvw.z) - p[2];
@@ -107,12 +113,12 @@ struct ICPCeres
         return true;
     }
 
-    static ceres::CostFunction* Creat(const Point3f uvw, const Point3f xyz){
+    static ceres::CostFunction* Creat(const cv::Point3f uvw, const cv::Point3f xyz){
         return (new ceres::AutoDiffCostFunction<ICPCeres,3,6>(new ICPCeres(uvw,xyz)));
     }
 
-    const Point3f _uvw;
-    const Point3f _xyz;
+    const cv::Point3f _uvw;
+    const cv::Point3f _xyz;
 };
 
 cloudwithdes curr_cloud;
@@ -132,7 +138,7 @@ double timeSurfPointsFlat = 0;
 double timeSurfPointsLessFlat = 0;
 double timeLaserCloudFullRes = 0;
 int nScans = 64; //Number of LiDAR scan lines
-float scanPeriod = 0.1
+float scanPeriod = 0.1;
 float minimumRange = 0.1;
 float distanceTh = 0.4;
 int matchTh = 6;
@@ -260,7 +266,7 @@ void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloud
 {
     mBuf.lock();
     fullPointsBuf.push(laserCloudFullRes2);
-    pcl::PointCloud<pcl::PointXYZI>::Ptr laserCloudFullRes;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr laserCloudFullRes(new pcl::PointCloud<pcl::PointXYZI>());
     pcl::fromROSMsg(*laserCloudFullRes2, *laserCloudFullRes);
 
     cloudwithdes curr_cloud;
@@ -270,11 +276,12 @@ void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloud
     mBuf.unlock();
 }
 
-void Registration(vector<pcl::PointXYZI> &keyPoint_curr, vector<pcl::PointXYZI> &keyPoint_last,vector<pair<int,int> &vMatchedIndex>,double (&T_curr2last)[6]);
+void Registration(vector<pcl::PointXYZI> &keyPoint_curr, vector<pcl::PointXYZI> &keyPoint_last,vector<pair<int,int>> &vMatchedIndex,double (&T_curr2last)[6])
 {
         vector<cv::Point3f> pts1,pts2;
-        for (int i = 0; i < vMatchedIndex.size(); i++)
+        for (size_t i = 0; i < vMatchedIndex.size(); i++)
         {
+            cv::Point3f point_curr,point_last;
             point_curr.x = keyPoint_curr[vMatchedIndex[i].first].x;
             point_curr.y = keyPoint_curr[vMatchedIndex[i].first].y;
             point_curr.z = keyPoint_curr[vMatchedIndex[i].first].z;
@@ -289,7 +296,7 @@ void Registration(vector<pcl::PointXYZI> &keyPoint_curr, vector<pcl::PointXYZI> 
         }
 
         ceres::Problem problem;
-        for (int i = 0; i < pts1.size(); i++)
+        for (size_t i = 0; i < pts2.size(); i++)
         {
             ceres::CostFunction* cost_function = ICPCeres::Creat(pts1[i],pts2[i]);
             //剔除外点
@@ -302,9 +309,6 @@ void Registration(vector<pcl::PointXYZI> &keyPoint_curr, vector<pcl::PointXYZI> 
             options.minimizer_progress_to_stdout = false;//默认情况下，Minimizer（优化器）进度会记录到stderr，具体取决于vlog级别
             ceres::Solver::Summary summary;
             ceres::Solve(options, &problem, &summary);
-
-
-        
 }
 
 
@@ -394,29 +398,28 @@ int main(int argc, char **argv)
 
             mBuf.unlock();
 //进行匹配
+            double T_curr2last[6] = {0,0,0,0,0,0};
             if(cloudwithdes_buff.size() > 0)
             {
-                vector<<pair<int,int>> matcheindex;
+                vector<pair<int,int>> matcheindex;
                 
-                LinK3D_Extractor::match(curr_cloud.cloud,last_cloud.cloud,curr_cloud.descriptor,last_cloud.descriptor,matcheindex);
+                pLinK3dExtractor->match(curr_cloud.cloud,last_cloud.cloud,curr_cloud.descriptor,last_cloud.descriptor,matcheindex);
                 
-                static T_curr2last[6] = {0,0,0,0,0,0};
-                Registration(curr_cloud.cloud,last_cloud.cloud,matcherindex,T_curr2last);
+                
+                Registration(curr_cloud.cloud,last_cloud.cloud,matcheindex,T_curr2last);
             }
-    cv::Mat R_vec = (Mat_<double>(3,1) << T_curr2last[0], T_curr2last[1], T_curr2last[2]);
+    cv::Mat R_vec = (cv::Mat_<double>(3,1) << T_curr2last[0], T_curr2last[1], T_curr2last[2]);
     cv::Mat R_cvest;
     // 罗德里格斯公式，旋转向量转旋转矩阵
-            cv::Rodrigues(R_vec, R_cvest);
+    cv::Rodrigues(R_vec, R_cvest);
     Eigen::Matrix<double,3,3> R_est;
     cv::cv2eigen(R_cvest, R_est);
-    Eigen::Quaterniond q(R_est);
+    Eigen::Quaterniond q(R_est.inverse());
     q.normalize();
     q_last_curr = q;
     //cout << "q = \n" << q.x() << " " << q.y() << " " << q.z() << " " << q.w()<< endl;
-    //cout << -T_curr2last[3] << " " <<  -T_curr2last[4] << " " << -T_curr2last[5] << endl;
-    //cout<<"R_est="<<R_est<<endl;
     Eigen::Vector3d t_est(T_curr2last[3], T_curr2last[4], T_curr2last[5]);
-    t_last_curr = t_est;
+    t_last_curr = -t_est;
     //cout<<"t_est="<<t_est<<endl;
     Eigen::Isometry3d T(R_est);//构造变换矩阵与输出
     T.pretranslate(t_est);
@@ -425,9 +428,10 @@ int main(int argc, char **argv)
     q_w_curr = q_w_curr * q_last_curr;
              last_cloud = curr_cloud;
              curr_cloud.cloud.clear();
-            
+             std::cout << "旋转"<< " " <<  q_w_curr.matrix()<< std::endl;
+    std::cout<<"位移"<<t_w_curr<<std::endl;
 
-            // TicToc t_whole;
+             TicToc t_whole;
             // // initializing
             // if (!systemInited)
             // {
